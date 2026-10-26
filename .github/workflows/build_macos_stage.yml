@@ -40,12 +40,17 @@ jobs:
           gh release download "$tag" -R "${{ github.repository }}"
           mkdir -p game_input
           unzip -o "*.zip" -d game_input
-          ls -la game_input
+          find game_input -type f
+          # Ensure prod.keys and ROM are accessible in the working folder
+          find game_input -name "prod.keys" -exec cp {} . \;
+          find game_input -name "*.xci" -o -name "*.nsp" -exec cp {} . \;
+          ls -la
 
       - name: Compile IPA via nxnative pipeline
         run: |
-          echo "Running build script..."
-          python3 scripts/build_ipa_from_nsp.py game_input/Arceus.xci -k game_input/prod.keys
+          ROM_FILE=$(find . -maxdepth 1 -name "*.xci" -o -name "*.nsp" | head -n 1)
+          echo "Compiling game using ROM: $ROM_FILE"
+          python3 scripts/build_ipa_from_nsp.py "$ROM_FILE" -k prod.keys
           
           mkdir -p build/output
           find . -maxdepth 3 -name "*.ipa" -exec cp {} build/output/ \;
