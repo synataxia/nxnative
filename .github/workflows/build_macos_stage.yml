@@ -37,25 +37,28 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           tag="hybrid-payload-$(echo ${{ github.event.inputs.title_id }} | tr '[:upper:]' '[:lower:]')"
-          gh release download "$tag" -R "${{ github.repository }}" || true
-          unzip -o "*.zip" || true
+          gh release download "$tag" -R "${{ github.repository }}"
+          unzip -o "*.zip"
           mkdir -p ~/.switch
           if [ -f "prod.keys" ]; then cp prod.keys ~/.switch/; fi
-          ls -la
+          echo "=== Workspace File Tree ==="
+          find . -maxdepth 3 -not -path '*/.*'
 
       - name: Compile IPA via nxnative pipeline
         run: |
-          echo "Building iOS IPA for Title ID: ${{ github.event.inputs.title_id }}"
+          ROM_FILE=$(find . -name "*.xci" -o -name "*.nsp" | head -n 1)
+          echo "Target ROM located: $ROM_FILE"
+          
           mkdir -p build/output
-          python3 scripts/build_ipa_from_nsp.py . --title-id "${{ github.event.inputs.title_id }}" --output build/output/PokemonLegendsArceus.ipa || \
-          python3 -m scripts.build_ipa_from_nsp . --title-id "${{ github.event.inputs.title_id }}" --output build/output/PokemonLegendsArceus.ipa || true
-          find . -maxdepth 4 -name "*.ipa" -exec cp {} build/output/ \; || true
+          
+          # Execute compiler with explicit paths and catch real errors if any occur
+          python3 scripts/build_ipa_from_nsp.py "$ROM_FILE" -k prod.keys --title-id "${{ github.event.inputs.title_id }}" --output build/output/PokemonLegendsArceus.ipa
+          
+          echo "=== Build Output Listing ==="
           ls -la build/output
 
       - name: Upload Compiled macOS Stage Artifact
         uses: actions/upload-artifact@v4
         with:
           name: compiled-ipa-${{ github.event.inputs.title_id }}
-          path: |
-            build/output/*.ipa
-            **/*.ipa
+          path: build/output/*.ipa
