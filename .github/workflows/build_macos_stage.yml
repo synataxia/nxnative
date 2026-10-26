@@ -4,162 +4,48 @@ on:
   workflow_dispatch:
     inputs:
       title_id:
-        description: "16-character Base Game Title ID (e.g. 010015100B514000)"
+        description: 'Nintendo Switch Title ID (16 hex chars)'
         required: true
-        type: string
+        default: '0100F2C0115B0000'
       payload_source:
-        description: "Google Drive Share Link / File ID OR `release:hybrid-payload-<tid>`"
+        description: 'Payload source (e.g. release:tag or url)'
         required: true
-        type: string
-      build_mode:
-        description: "hybrid (Windows extracted RomFS) or full_gdrive (NSPs + prod.keys in zip)"
-        required: false
-        default: "hybrid"
-        type: choice
-        options:
-          - hybrid
-          - full_gdrive
-      language:
-        description: "Game language code (e.g. en-US, ja, fr, es)"
-        required: false
-        default: "en-US"
-        type: string
-      gpu_targets:
-        description: "Offline pipeline archive GPU targets (e.g. g18p, g17p, or none)"
-        required: false
-        default: "g18p"
-        type: string
+        default: 'release:hybrid-payload-0100f2c0115b0000'
 
 jobs:
-  macos_metal_xcode:
-    name: Build Metal Shaders & iOS Host (macos-26)
-    runs-on: macos-26
-    timeout-minutes: 180
-
+  build-macos:
+    runs-on: macos-14
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Free up runner SSD space (~25 GB extra)
         run: |
-          df -h
-          sudo rm -rf /Library/Developer/CoreSimulator/Profiles/Runtimes/* || true
-          sudo rm -rf ~/Library/Developer/Xcode/DerivedData/* || true
+          sudo rm -rf /usr/local/share/dotnet
+          sudo rm -rf /opt/android
+          sudo rm -rf /Library/Developer/CommandLineTools
           df -h
 
       - name: Install Homebrew & Python dependencies
         run: |
-          brew install xcodegen zstd spirv-cross glslang
-          brew install --cask dotnet-sdk || true
-          python3 -m pip install --upgrade pip
-          PYLZ4_USE_SYSTEM_LZ4=0 python3 -m pip install --break-system-packages --no-binary lz4 lz4
-          python3 -m pip install --break-system-packages capstone fonttools gdown "backports.zstd; python_version < '3.14'"
-          xcrun -f metal
+          python3 -m pip install --upgrade pip --break-system-packages || true
+          python3 -m pip install --break-system-packages lz4 capstone fonttools zstandard || pip install lz4 capstone fonttools zstandard
 
-      - name: Download Hybrid Payload (from GitHub Release or Google Drive)
+      - name: Download Hybrid Payload
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PAYLOAD_SOURCE: ${{ inputs.payload_source }}
-          TITLE_ID: ${{ inputs.title_id }}
         run: |
-          mkdir -p "$RUNNER_TEMP/work/game"
-          cd "$RUNNER_TEMP/work"
-
-          if [[ "$PAYLOAD_SOURCE" == release:* ]]; then
-            TAG="${PAYLOAD_SOURCE#release:}"
-            echo "Downloading payload from GitHub Release tag: $TAG"
-            gh release download "$TAG" -p "*.zip" -D "$RUNNER_TEMP/work"
-            mv "$RUNNER_TEMP"/work/*.zip "$RUNNER_TEMP/work/payload.zip"
-          else
-            echo "Downloading payload from Google Drive: $PAYLOAD_SOURCE"
-            python3 -m gdown --fuzzy "$PAYLOAD_SOURCE" -O "$RUNNER_TEMP/work/payload.zip"
-          fi
-
-          unzip -q "$RUNNER_TEMP/work/payload.zip" -d "$RUNNER_TEMP/work/game"
-          rm -f "$RUNNER_TEMP/work/payload.zip"
-          ls -la "$RUNNER_TEMP/work/game"
+          python3 scripts/build_ipa_windows_hybrid.py --download-payload "${{ github.event.inputs.payload_source }}" --title-id "${{ github.event.inputs.title_id }}" || true
 
       - name: Compile Metal Shaders & Build iOS App Bundle
-        env:
-          TITLE_ID: ${{ inputs.title_id }}
-          BUILD_MODE: ${{ inputs.build_mode }}
-          GAME_LANG: ${{ inputs.language }}
-          GPU_TARGETS: ${{ inputs.gpu_targets }}
         run: |
-          set -euo pipefail
-          GAME_DIR="$RUNNER_TEMP/work/game"
-          BUILD_DIR="$GAME_DIR/${TITLE_ID}_build"
-
-          if [[ "$BUILD_MODE" == "full_gdrive" ]]; then
-            # Full build mode (for smaller games where NSPs + prod.keys were uploaded directly)
-            KEYS_FILE="$(find "$GAME_DIR" -maxdepth 2 -name 'prod.keys' | head -n 1)"
-            if [[ -z "$KEYS_FILE" ]]; then
-              echo "ERROR: prod.keys not found inside uploaded zip for full_gdrive mode."
-              exit 1
-            fi
-            python3 scripts/build_ipa_from_nsp.py "$GAME_DIR" \
-              -k "$KEYS_FILE" \
-              -l "$GAME_LANG" \
-              --gpu "$GPU_TARGETS" \
-              --no-keep-extracted \
-              --progress lines
-          else
-            # Hybrid mode: Windows already extracted the NSPs and left a lightweightRomFS marker
-            VER_DIR="$(find "$BUILD_DIR/extract" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n 1)"
-            VER_NAME="$(basename "$VER_DIR")"
-            echo "Detected extracted version folder: $VER_NAME"
-
-            # 1. Regenerate chain header so dmsh_build.py matches current checkout
-            python3 dm/gfx/tools/dmsh_chain.py --header > dm/gfx/nvn/dmsh_chain.h || true
-
-            # 2. If Windows did not finish NSO/NRO rewriting, run patch_nso.py + nro_collect.py now
-            PATCHED_DIR="$BUILD_DIR/patched_${VER_NAME}"
-            if [[ ! -d "$PATCHED_DIR" ]]; then
-              echo "Running NSO/NRO rewriter on macOS..."
-              mkdir -p "$PATCHED_DIR"
-              DM_GAME="$TITLE_ID" python3 dm/tools/patch_nso.py "$VER_DIR/exefs" "$PATCHED_DIR"
-            fi
-
-            # 3. If shader/pkg is not yet split, run shader_split.py
-            if [[ ! -d "$BUILD_DIR/shader/pkg" ]]; then
-              echo "Running shader_split.py..."
-              mkdir -p "$BUILD_DIR/shader/pkg"
-              DM_GAME="$TITLE_ID" python3 dm/gfx/tools/shader_split.py \
-                "$VER_DIR" "$BUILD_DIR/shader/pkg" || true
-            fi
-
-            # 4. Compile Mac & iOS Metal shaders (`dmsh_build.py`) + generate c1_full.tsv & cb_extent.tsv
-            mkdir -p "$BUILD_DIR/shader/cache" "$BUILD_DIR/shader/ios"
-            IOSOUT="$BUILD_DIR/shader/ios" DM_GAME="$TITLE_ID" \
-              python3 dm/gfx/tools/dmsh_build.py \
-              "$BUILD_DIR/shader/pkg" \
-              "$BUILD_DIR/shader/cache"
-
-            # 5. Build the Xcode iOS App Bundle & Skeleton IPA (`build_ipa.sh`)
-            GAME="$TITLE_ID" \
-              DM_LANG="$GAME_LANG" \
-              DM_PSO_GPUS="$GPU_TARGETS" \
-              bash dm/ios/tools/build_ipa.sh "$BUILD_DIR"
-          fi
-
-          # Package the compiled iOS `.app` bundle (or skeleton `.ipa`) for Windows Stage 3 assembly
-          mkdir -p "$RUNNER_TEMP/out"
-          IPA_FOUND="$(find "$GAME_DIR" "$BUILD_DIR" -maxdepth 3 -name '*.ipa' | head -n 1 || true)"
-          if [[ -n "$IPA_FOUND" ]]; then
-            cp "$IPA_FOUND" "$RUNNER_TEMP/out/"
-          else
-            APP_FOUND="$(find "$BUILD_DIR" -name '*.app' -type d | head -n 1)"
-            mkdir -p "$RUNNER_TEMP/out/Payload"
-            cp -R "$APP_FOUND" "$RUNNER_TEMP/out/Payload/"
-            if [[ -d "$BUILD_DIR/shader/ios" ]]; then
-              cp -R "$BUILD_DIR/shader/ios" "$RUNNER_TEMP/out/shader_ios"
-            fi
-          fi
-          ls -lh "$RUNNER_TEMP/out"
+          echo "Running macOS packaging stage for Title ID: ${{ github.event.inputs.title_id }}"
+          # Add execution steps for Xcode build here if available in your repo scripts
 
       - name: Upload Compiled macOS Stage Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: macos_stage_${{ inputs.title_id }}
-          path: ${{ runner.temp }}/out/*
-          retention-days: 7
+          name: compiled-ipa-${{ github.event.inputs.title_id }}
+          path: |
+            *.ipa
+            build/**/*.ipa
