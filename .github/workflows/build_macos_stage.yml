@@ -8,56 +8,117 @@ on:
         required: true
         default: '0100F2C0115B0000'
       payload_source:
-        description: 'Payload source (e.g. release:tag or url)'
+        description: 'Payload source (e.g. release:tag)'
         required: true
         default: 'release:hybrid-payload-0100f2c0115b0000'
+
+permissions:
+  contents: write
 
 jobs:
   build-macos:
     runs-on: macos-14
+    timeout-minutes: 120
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Free up runner SSD space (~25 GB extra)
+      - name: Free up unused runner space (keeping .NET and Xcode CommandLineTools)
         run: |
-          sudo rm -rf /usr/local/share/dotnet
-          sudo rm -rf /opt/android
-          sudo rm -rf /Library/Developer/CommandLineTools
+          sudo rm -rf /opt/android || true
+          sudo rm -rf /Users/runner/hostedtoolcache/CodeQL || true
           df -h
 
-      - name: Install Dependencies & Xcode Tools
+      - name: Setup .NET SDK for nx_extract
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            8.0.x
+            9.0.x
+            10.0.x
+
+      - name: Install Homebrew, XcodeGen & Python dependencies
         run: |
           brew install xcodegen zstd spirv-cross glslang --quiet || true
-          python3 -m pip install --upgrade pip --break-system-packages || true
-          python3 -m pip install --break-system-packages lz4 capstone fonttools zstandard || true
+          python3 -m pip install --break-system-packages lz4 capstone fonttools zstandard || \
+          pip3 install --break-system-packages lz4 capstone fonttools zstandard
 
-      - name: Download Payload & ROM
+      - name: Download & Unpack Hybrid Payload
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          tag="hybrid-payload-$(echo ${{ github.event.inputs.title_id }} | tr '[:upper:]' '[:lower:]')"
-          gh release download "$tag" -R "${{ github.repository }}"
+          TID_LOWER=$(echo "${{ github.event.inputs.title_id }}" | tr '[:upper:]' '[:lower:]')
+          TAG="hybrid-payload-${TID_LOWER}"
+          echo "Downloading release assets from tag: $TAG"
+          gh release download "$TAG" -R "${{ github.repository }}" --clobber
+
           mkdir -p game_input
-          unzip -o "*.zip" -d game_input
-          find game_input -type f
-          # Ensure prod.keys and ROM are accessible in the working folder
-          find game_input -name "prod.keys" -exec cp {} . \;
-          find game_input -name "*.xci" -o -name "*.nsp" -exec cp {} . \;
-          ls -la
+          if ls *.part* 1> /dev/null 2>&1; then
+            echo "Reassembling multi-part payload archive..."
+            cat cloud_payload_*.zip.part* > cloud_payload_combined.zip
+            rm -f cloud_payload_*.zip.part*
+            unzip -q -o cloud_payload_combined.zip -d game_input
+            rm -f cloud_payload_combined.zip
+          else
+            unzip -q -o "cloud_payload_*.zip" -d game_input
+            rm -f cloud_payload_*.zip
+          fi
+
+          if [ -f "prod.keys" ] && [ ! -f "game_input/prod.keys" ]; then
+            cp prod.keys game_input/prod.keys
+          fi
+          mkdir -p ~/.switch
+          if [ -f "game_input/prod.keys" ]; then
+            cp game_input/prod.keys ~/.switch/prod.keys
+          fi
+
+          echo "=== Contents of game_input ==="
+          ls -lh game_input
+          find game_input -maxdepth 4 -not -name ".keep"
+
+          # Fail fast with a clear message if the old 273-byte dummy zip is still in the release
+          REAL_FILES=$(find game_input -type f ! -name "hybrid_manifest.json" ! -name "prod.keys" ! -name ".keep" | wc -l | tr -d ' ')
+          if [ "$REAL_FILES" -eq "0" ]; then
+            echo "::error::The downloaded GitHub Release payload only contained hybrid_manifest.json and .keep! Re-run 'python scripts/build_ipa_windows_hybrid.py prepare ... --trigger-cloud' on Windows so the real ROM is uploaded."
+            exit 1
+          fi
 
       - name: Compile IPA via nxnative pipeline
         run: |
-          ROM_FILE=$(find . -maxdepth 1 -name "*.xci" -o -name "*.nsp" | head -n 1)
-          echo "Compiling game using ROM: $ROM_FILE"
-          python3 scripts/build_ipa_from_nsp.py "$ROM_FILE" -k prod.keys
-          
-          mkdir -p build/output
-          find . -maxdepth 3 -name "*.ipa" -exec cp {} build/output/ \;
-          ls -la build/output
+          TID="${{ github.event.inputs.title_id }}"
+          mkdir -p "$GITHUB_WORKSPACE/build/output"
+          OUT_IPA="$GITHUB_WORKSPACE/build/output/${TID}.ipa"
+
+          echo "Starting nxnative IPA build for Title ID: $TID"
+          python3 scripts/build_ipa_from_nsp.py game_input \
+            -k game_input/prod.keys \
+            -o "$OUT_IPA" \
+            --gpu none \
+            --no-heap-check \
+            --allow-shader-regressions \
+            --progress lines
+
+          # Also collect any .ipa written inside game_input if output path was overridden by profile
+          find game_input -maxdepth 3 -name "*.ipa" -exec cp {} "$GITHUB_WORKSPACE/build/output/" \; || true
+
+          echo "=== Verifying build/output ==="
+          ls -lh "$GITHUB_WORKSPACE/build/output"
+          if ! ls "$GITHUB_WORKSPACE/build/output/"*.ipa 1> /dev/null 2>&1; then
+            echo "::error::No .ipa file was generated in build/output!"
+            exit 1
+          fi
+
+      - name: Attach Compiled IPA to GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TID_LOWER=$(echo "${{ github.event.inputs.title_id }}" | tr '[:upper:]' '[:lower:]')
+          TAG="hybrid-payload-${TID_LOWER}"
+          gh release upload "$TAG" "$GITHUB_WORKSPACE/build/output/"*.ipa --clobber -R "${{ github.repository }}" || true
 
       - name: Upload Compiled macOS Stage Artifact
         uses: actions/upload-artifact@v4
         with:
           name: compiled-ipa-${{ github.event.inputs.title_id }}
           path: build/output/*.ipa
+          if-no-files-found: error
