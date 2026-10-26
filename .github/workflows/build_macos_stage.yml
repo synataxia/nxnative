@@ -47,8 +47,8 @@ jobs:
         run: |
           echo "Building iOS IPA for Title ID: ${{ github.event.inputs.title_id }}"
           mkdir -p build/output
-          python3 scripts/build_ipa_from_nsp.py *.xci *.nsp --title-id "${{ github.event.inputs.title_id }}" --output build/output/PokemonLegendsArceus.ipa || \
-          python3 -m scripts.build_ipa_from_nsp --title-id "${{ github.event.inputs.title_id }}" --output build/output/PokemonLegendsArceus.ipa || true
+          python3 scripts/build_ipa_from_nsp.py . --title-id "${{ github.event.inputs.title_id }}" --output build/output/PokemonLegendsArceus.ipa || \
+          python3 -m scripts.build_ipa_from_nsp . --title-id "${{ github.event.inputs.title_id }}" --output build/output/PokemonLegendsArceus.ipa || true
           find . -maxdepth 4 -name "*.ipa" -exec cp {} build/output/ \; || true
           ls -la build/output
 
