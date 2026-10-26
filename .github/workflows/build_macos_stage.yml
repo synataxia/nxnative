@@ -26,32 +26,36 @@ jobs:
           sudo rm -rf /Library/Developer/CommandLineTools
           df -h
 
-      - name: Install Homebrew & Python dependencies & Xcode tools
+      - name: Install Dependencies & Xcode Tools
         run: |
+          brew install xcodegen zstd spirv-cross glslang --quiet || true
           python3 -m pip install --upgrade pip --break-system-packages || true
-          python3 -m pip install --break-system-packages lz4 capstone fonttools zstandard || pip install lz4 capstone fonttools zstandard
-          brew install xcodegen || true
+          python3 -m pip install --break-system-packages lz4 capstone fonttools zstandard || true
 
-      - name: Download and Unpack Payload
+      - name: Download Payload & ROM
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           tag="hybrid-payload-$(echo ${{ github.event.inputs.title_id }} | tr '[:upper:]' '[:lower:]')"
           gh release download "$tag" -R "${{ github.repository }}" || true
-          mkdir -p work_payload
-          unzip -o "*.zip" -d work_payload || true
-          ls -la work_payload
+          unzip -o "*.zip" || true
+          mkdir -p ~/.switch
+          if [ -f "prod.keys" ]; then cp prod.keys ~/.switch/; fi
+          ls -la
 
-      - name: Compile IPA
+      - name: Compile IPA via nxnative pipeline
         run: |
-          echo "Running build pipeline for Title ID: ${{ github.event.inputs.title_id }}"
+          echo "Building iOS IPA for Title ID: ${{ github.event.inputs.title_id }}"
           mkdir -p build/output
-          python3 scripts/build_ipa_from_nsp.py work_payload --title-id "${{ github.event.inputs.title_id }}" --output build/output/PokemonLegendsArceus.ipa || python3 scripts/build_ipa_from_nsp.py --title-id "${{ github.event.inputs.title_id }}" --output build/output/PokemonLegendsArceus.ipa || true
-          find . -maxdepth 3 -name "*.ipa" -exec cp {} build/output/ \; || true
+          python3 scripts/build_ipa_from_nsp.py *.xci *.nsp --title-id "${{ github.event.inputs.title_id }}" --output build/output/PokemonLegendsArceus.ipa || \
+          python3 -m scripts.build_ipa_from_nsp --title-id "${{ github.event.inputs.title_id }}" --output build/output/PokemonLegendsArceus.ipa || true
+          find . -maxdepth 4 -name "*.ipa" -exec cp {} build/output/ \; || true
           ls -la build/output
 
       - name: Upload Compiled macOS Stage Artifact
         uses: actions/upload-artifact@v4
         with:
           name: compiled-ipa-${{ github.event.inputs.title_id }}
-          path: build/output/*.ipa
+          path: |
+            build/output/*.ipa
+            **/*.ipa
