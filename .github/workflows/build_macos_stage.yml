@@ -42,10 +42,14 @@ jobs:
           unzip -o "*.zip" -d game_input
           ls -la game_input
 
+      - name: Inspect Build Script Usage
+        run: |
+          python3 scripts/build_ipa_from_nsp.py --help || true
+
       - name: Compile IPA via nxnative pipeline
         run: |
-          echo "Running build script on extracted game directory..."
-          python3 scripts/build_ipa_from_nsp.py game_input -k game_input/prod.keys
+          echo "Running build script with verbose diagnostics..."
+          python3 scripts/build_ipa_from_nsp.py game_input/Arceus.xci -k game_input/prod.keys --title-id "${{ github.event.inputs.title_id }}"
           
           mkdir -p build/output
           find . -maxdepth 3 -name "*.ipa" -exec cp {} build/output/ \;
